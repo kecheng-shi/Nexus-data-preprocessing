@@ -245,7 +245,7 @@ def _simple_impl(input_path: str, output_base: str):
         return __compute(input_path, output_base)
     except RecursionError:
         # Fallback to recomputing without aliasing
-        return compute_again(input_path, output_base)
+        return preprocess_cat_excel_simple(input_path, output_base)
 
 
 def __compute(input_path: str, output_base: str):
