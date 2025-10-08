@@ -171,6 +171,27 @@ def preprocess_cat_excel(input_path: str, output_base: str):
     adj_close_col = _first_present(original_cols, ["adj close", "adjusted close"])
     volume_col = _first_present(original_cols, ["volume", "vol", "qty", "turnover"])
 
+    # Heuristic fallback for unlabeled OHLCV spreadsheets (e.g., Bloomberg exports)
+    # Pattern: first column is date, then 4 numeric columns (O/H/L/C) and an optional volume column
+    if close_col is None and date_col is None and original_cols:
+        # Try to infer date from the first column if it parses as dates
+        maybe_date = original_cols[0]
+        parsed = pd.to_datetime(df[maybe_date], errors="coerce")
+        if parsed.notna().mean() > 0.7:
+            date_col = maybe_date
+
+    if close_col is None and date_col is not None:
+        # Collect candidate unlabeled columns that look numeric
+        unlabeled = [c for c in original_cols if c != date_col and str(c).lower().startswith("unnamed")]
+        if len(unlabeled) >= 4:
+            # Assume standard order: Open, High, Low, Close, [Volume]
+            open_col = open_col or unlabeled[0]
+            high_col = high_col or unlabeled[1]
+            low_col = low_col or unlabeled[2]
+            close_col = unlabeled[3]
+            if len(unlabeled) >= 5 and volume_col is None:
+                volume_col = unlabeled[4]
+
     # 3) dates
     if date_col is None:
         maybe_date = original_cols[0]
@@ -339,6 +360,22 @@ def preprocess_cat_excel_simple(input_path: str, output_base: str):
         close_col = _first_present(original_cols, ["close", "px_last", "price", "last"]) or close_col
     adj_close_col = _first_present(original_cols, ["adj close", "adjusted close"])
     volume_col = _first_present(original_cols, ["volume", "vol", "qty", "turnover"])
+
+    # Heuristic fallback: unlabeled OHLCV columns as in many Bloomberg exports
+    if close_col is None and date_col is None and original_cols:
+        maybe_date = original_cols[0]
+        parsed = pd.to_datetime(df[maybe_date], errors="coerce")
+        if parsed.notna().mean() > 0.7:
+            date_col = maybe_date
+    if close_col is None and date_col is not None:
+        unlabeled = [c for c in original_cols if c != date_col and str(c).lower().startswith("unnamed")]
+        if len(unlabeled) >= 4:
+            open_col = open_col or unlabeled[0]
+            high_col = high_col or unlabeled[1]
+            low_col = low_col or unlabeled[2]
+            close_col = unlabeled[3]
+            if len(unlabeled) >= 5 and volume_col is None:
+                volume_col = unlabeled[4]
 
     if date_col is None:
         maybe_date = original_cols[0]
