@@ -1,0 +1,4 @@
+series,date,adj_close,ret,ret_w,ret_vol_scaled,ret_vol_scaled_w,vol_20,vol_60,rv_20_annual,rv_60_annual,rsi14,macd,macd_signal,macd_hist,bb_mid,bb_upper,bb_lower
+International Business Machine - IBM US 12_19_25 C150 Equity Equity,2025-08-11T00:00:00.000000,1754870400000000.0,,,,,,,,,,0.0,0.0,0.0,,,
+International Business Machine - IBM US 12_19_25 C150 Equity Equity,2025-08-12T00:00:00.000000,1754956800000000.0,0.00004923319303173912,0.00004923319303173912,,,,,,,,6892307692.5,1378461538.5,5513846154.0,,,
+International Business Machine - IBM US 12_19_25 C150 Equity Equity,2025-08-13T00:00:00.000000,1755043200000000.0,0.00004923076924256975,0.00004923076924256975,,,,,,,,19106026737.0,4923974578.2,14182052158.8,,,
