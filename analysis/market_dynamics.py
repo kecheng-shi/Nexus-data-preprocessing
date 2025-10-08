@@ -1,10 +1,10 @@
 """Market dynamics analysis toolkit.
 
 This module assembles utilities to:
-- load macro, asset, and sentiment time series from the INDEX directory
-- study macroeconomic factor influence on asset returns via OLS regressions
-- estimate cross-asset lead/lag structure using VAR and causality tests
-- detect market regimes with a Gaussian mixture model on returns/volatility
+- load macro, asset, and sentiment time series from the repository datasets
+- study macroeconomic factor influence on asset returns via lightweight OLS regressions
+- estimate cross-asset lead/lag structure with rolling correlation heuristics
+- detect market regimes with an unsupervised clustering pass on returns/volatility
 - explore behavioral finance proxies such as volatility and sentiment shocks
 
 Run the module as a script to execute the full workflow using the default
@@ -16,27 +16,138 @@ from __future__ import annotations
 import argparse
 import logging
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
-from typing import Callable, Dict, Optional, Sequence
+from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-try:
-    import statsmodels.api as sm
-    from statsmodels.regression.rolling import RollingOLS
-    from statsmodels.tsa.vector_ar.var_model import VAR
-except ImportError:  # pragma: no cover
-    sm = None
-    RollingOLS = None
-    VAR = None
 
-try:
-    from sklearn.mixture import GaussianMixture
-    from sklearn.preprocessing import StandardScaler
-except ImportError:  # pragma: no cover
-    GaussianMixture = None
-    StandardScaler = None
+def _normal_cdf(x: np.ndarray) -> np.ndarray:
+    """Standard normal cumulative distribution function."""
+    x_arr = np.asarray(x, dtype=float)
+    return 0.5 * (1.0 + np.erf(x_arr / np.sqrt(2.0)))
+
+
+def _ols_fit(y: np.ndarray, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    """Return beta, standard error, t-stats, p-values, and R^2 for an OLS regression."""
+    XtX = X.T @ X
+    try:
+        XtX_inv = np.linalg.inv(XtX)
+    except np.linalg.LinAlgError:
+        XtX_inv = np.linalg.pinv(XtX)
+    beta = XtX_inv @ X.T @ y
+    resid = y - X @ beta
+    dof = max(len(y) - X.shape[1], 1)
+    sigma2 = float(resid.T @ resid) / dof
+    se = np.sqrt(np.diag(XtX_inv) * sigma2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_vals = np.divide(beta, se, out=np.full_like(beta, np.nan), where=se != 0)
+    p_vals = 2.0 * (1.0 - _normal_cdf(np.abs(t_vals)))
+    denom = float(((y - y.mean()) ** 2).sum())
+    r_sq = np.nan if denom == 0 else 1.0 - float((resid ** 2).sum()) / denom
+    return beta, se, t_vals, p_vals, r_sq
+
+
+def _rolling_ols(y: pd.Series, X: pd.DataFrame, window: int) -> pd.DataFrame:
+    """Compute rolling OLS parameters for a fixed window."""
+    if window is None or window <= 0 or window > len(y):
+        return pd.DataFrame()
+    beta_rows = []
+    idx = []
+    design_cols = ["const"] + list(X.columns)
+    for start in range(0, len(y) - window + 1):
+        end = start + window
+        y_win = y.iloc[start:end].to_numpy()
+        X_win = X.iloc[start:end].to_numpy()
+        X_design = np.column_stack([np.ones(len(X_win)), X_win])
+        beta, *_ = _ols_fit(y_win, X_design)
+        beta_rows.append(beta)
+        idx.append(y.index[end - 1])
+    return pd.DataFrame(beta_rows, index=idx, columns=design_cols)
+
+
+def _kmeans(
+    data: np.ndarray,
+    k: int,
+    *,
+    n_init: int = 10,
+    max_iter: int = 100,
+    random_state: int = 42,
+) -> np.ndarray:
+    """Simple k-means implementation (Euclidean) with multiple initialisations."""
+    data = np.asarray(data, dtype=float)
+    if data.ndim != 2 or len(data) == 0:
+        return np.array([], dtype=int)
+    n_samples = data.shape[0]
+    if n_samples < k:
+        return np.arange(n_samples, dtype=int)
+    rng = np.random.default_rng(random_state)
+    best_labels: Optional[np.ndarray] = None
+    best_inertia = np.inf
+    for _ in range(n_init):
+        centroids = data[rng.choice(n_samples, size=k, replace=False)]
+        labels = np.zeros(n_samples, dtype=int)
+        for _ in range(max_iter):
+            distances = np.linalg.norm(data[:, None, :] - centroids[None, :, :], axis=2)
+            labels = distances.argmin(axis=1)
+            new_centroids = np.array(
+                [
+                    data[labels == j].mean(axis=0) if np.any(labels == j) else centroids[j]
+                    for j in range(k)
+                ]
+            )
+            if np.allclose(new_centroids, centroids, atol=1e-6, rtol=0):
+                centroids = new_centroids
+                break
+            centroids = new_centroids
+        inertia = float(np.sum((data - centroids[labels]) ** 2))
+        if inertia < best_inertia:
+            best_inertia = inertia
+            best_labels = labels.copy()
+    assert best_labels is not None
+    return best_labels
+
+
+def _read_excel_with_openpyxl(path: Path) -> pd.DataFrame:
+    """Fallback Excel reader for Bloomberg exports with array formulas."""
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError("openpyxl is required to parse Bloomberg Excel exports") from exc
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    ws = wb.active
+    rows = []
+    for row in ws.iter_rows(values_only=True):
+        if not row:
+            continue
+        if not any(cell is not None for cell in row):
+            continue
+        rows.append(list(row))
+    wb.close()
+    if not rows:
+        return pd.DataFrame()
+
+    start_idx = None
+    for idx, row in enumerate(rows):
+        first = row[0]
+        if isinstance(first, (datetime, date)) and first is not None:
+            start_idx = idx
+            break
+    if start_idx is None:
+        raise ValueError(f"Could not find a date column in {path}")
+
+    data_rows = rows[start_idx:]
+    max_len = max(len(row) for row in data_rows)
+    normalized = []
+    for row in data_rows:
+        padded = row + [None] * (max_len - len(row))
+        normalized.append(padded[:max_len])
+    columns = [f"col_{idx}" for idx in range(max_len)]
+    frame = pd.DataFrame(normalized, columns=columns)
+    return frame.replace({"#N/A N/A": np.nan, "#N/A": np.nan})
 
 
 @dataclass
@@ -57,12 +168,15 @@ def load_excel_series(config: SeriesConfig, data_root: Path) -> pd.Series:
     if not full_path.exists():
         raise FileNotFoundError(f"Missing file for {config.name}: {full_path}")
 
-    raw = pd.read_excel(full_path)
+    try:
+        raw = pd.read_excel(full_path)
+    except Exception:
+        raw = _read_excel_with_openpyxl(full_path)
     if raw.empty:
         raise ValueError(f"File {full_path} has no rows")
 
     columns = list(raw.columns)
-    raw = raw.copy()
+    raw = raw.copy().replace({"#N/A N/A": np.nan, "#N/A": np.nan})
     date_col = columns[0]
     raw[date_col] = pd.to_datetime(raw[date_col], errors="coerce")
     raw = raw.dropna(subset=[date_col])
@@ -133,96 +247,95 @@ def run_macro_regressions(
     returns: pd.DataFrame,
     macro_features: pd.DataFrame,
     window: Optional[int] = 126,
-) -> Dict[str, Dict[str, pd.DataFrame]]:
-    if sm is None:
-        raise ImportError("statsmodels is required for macro regressions")
-
+) -> Tuple[Dict[str, Dict[str, pd.DataFrame]], pd.DataFrame, pd.DataFrame]:
     macro_models: Dict[str, Dict[str, pd.DataFrame]] = {}
+    beta_records: list[Dict[str, float]] = []
+    corr_records: list[Dict[str, float]] = []
     for asset in returns.columns:
         data = pd.concat([returns[asset], macro_features], axis=1).dropna()
         if data.empty:
             continue
-        y = data[asset]
-        X = data.drop(columns=[asset])
-        X = sm.add_constant(X)
-        ols = sm.OLS(y, X).fit()
-
-        rolling_summary = None
-        if window and window < len(data) and RollingOLS is not None:
-            roll_mod = RollingOLS(y, X, window=window)
-            roll_res = roll_mod.fit()
-            rolling_summary = roll_res.params
-
+        y = data[asset].to_numpy()
+        X_no_const = data.drop(columns=[asset])
+        X_design = np.column_stack([np.ones(len(X_no_const)), X_no_const.to_numpy()])
+        beta, se, t_vals, p_vals, r_sq = _ols_fit(y, X_design)
+        index = ["const"] + list(X_no_const.columns)
         macro_models[asset] = {
-            "coef": ols.params.to_frame(name="coef"),
-            "tvalue": ols.tvalues.to_frame(name="tvalue"),
-            "pvalue": ols.pvalues.to_frame(name="pvalue"),
-            "rsquared": pd.DataFrame({"rsquared": [ols.rsquared]}),
+            "coef": pd.DataFrame({"coef": beta}, index=index),
+            "stderr": pd.DataFrame({"stderr": se}, index=index),
+            "tvalue": pd.DataFrame({"tvalue": t_vals}, index=index),
+            "pvalue": pd.DataFrame({"pvalue": p_vals}, index=index),
+            "rsquared": pd.DataFrame({"rsquared": [r_sq]}),
         }
-        if rolling_summary is not None:
-            macro_models[asset]["rolling_coef"] = rolling_summary
-    return macro_models
+        for factor, coef_val, err_val, t_val, p_val in zip(
+            index[1:], beta[1:], se[1:], t_vals[1:], p_vals[1:]
+        ):
+            beta_records.append(
+                {
+                    "asset_class": asset,
+                    "macro_factor": factor,
+                    "beta": coef_val,
+                    "stderr": err_val,
+                    "tvalue": t_val,
+                    "pvalue": p_val,
+                    "r_squared": r_sq,
+                }
+            )
+        corr_series = data.corr().loc[asset].drop(asset, errors="ignore")
+        for factor, corr_val in corr_series.items():
+            corr_records.append(
+                {
+                    "asset_class": asset,
+                    "macro_factor": factor,
+                    "correlation": corr_val,
+                }
+            )
+        if window and window < len(data):
+            rolling = _rolling_ols(data[asset], X_no_const, window)
+            if not rolling.empty:
+                macro_models[asset]["rolling_coef"] = rolling
+    macro_beta_table = pd.DataFrame(beta_records)
+    macro_corr_table = pd.DataFrame(corr_records)
+    return macro_models, macro_beta_table, macro_corr_table
 
 
 def estimate_cross_asset_influence(
     returns: pd.DataFrame,
     maxlags: int = 5,
-) -> Dict[str, Dict[str, pd.DataFrame]]:
-    if VAR is None:
-        raise ImportError("statsmodels is required for VAR analysis")
+) -> Dict[str, pd.DataFrame]:
+    records = []
+    monthly = returns.resample("M").sum(min_count=1)
+    monthly = monthly.dropna(how="all")
+    if monthly.empty:
+        return {"lead_lag_table": pd.DataFrame(), "top_leads": pd.DataFrame()}
 
-    clean = returns.dropna()
-    model = VAR(clean)
-    fit = model.fit(maxlags=maxlags, ic="aic")
-
-    causality = {}
-    for cause in clean.columns:
-        for effect in clean.columns:
-            if cause == effect:
+    for source in monthly.columns:
+        for target in monthly.columns:
+            if source == target:
                 continue
-            test = fit.test_causality(effect, [cause], kind="f")
-            causality_key = f"{cause}->{effect}"
-            crit = getattr(test, "critical_value", np.nan)
-            causality[causality_key] = pd.DataFrame(
-                {
-                    "test_stat": [test.test_statistic],
-                    "pvalue": [test.pvalue],
-                    "crit": [crit],
-                }
-            )
+            base = pd.concat([monthly[source], monthly[target]], axis=1, join="inner").dropna()
+            if base.empty:
+                continue
+            for lag in range(1, maxlags + 1):
+                shifted = base[source].shift(-lag)
+                corr = shifted.corr(base[target])
+                if pd.notna(corr):
+                    records.append(
+                        {
+                            "leader": source,
+                            "follower": target,
+                            "lag_months": lag,
+                            "lead_correlation": corr,
+                        }
+                    )
 
-    fevd = fit.fevd(10)
-    fevd_frames = {
-        col: fevd.decomp[:, idx, :]
-        for idx, col in enumerate(clean.columns)
-    }
-    fevd_summary = {
-        col: pd.DataFrame(
-            fevd_frames[col],
-            index=[f"h{h}" for h in range(1, fevd_frames[col].shape[0] + 1)],
-            columns=[f"{other}_share" for other in clean.columns],
-        )
-        for col in clean.columns
-    }
-
-    impulse = fit.irf(10)
-    horizons = pd.Index(range(impulse.irfs.shape[0]), name="horizon")
-    impulse_frames = {
-        f"{shock}->{target}": pd.DataFrame(
-            impulse.irfs[:, target_idx, shock_idx],
-            index=horizons,
-            columns=["response"],
-        )
-        for shock_idx, shock in enumerate(clean.columns)
-        for target_idx, target in enumerate(clean.columns)
-    }
-
-    return {
-        "model_summary": {"aic": fit.aic, "bic": fit.bic, "lags": fit.k_ar},
-        "causality": causality,
-        "fevd": fevd_summary,
-        "impulse_responses": impulse_frames,
-    }
+    table = pd.DataFrame(records)
+    top = (
+        table.sort_values("lead_correlation", ascending=False).head(10)
+        if not table.empty
+        else pd.DataFrame()
+    )
+    return {"lead_lag_table": table, "top_leads": top}
 
 
 def detect_market_regimes(
@@ -230,28 +343,30 @@ def detect_market_regimes(
     vol_window: int = 21,
     components: int = 3,
 ) -> pd.DataFrame:
-    if GaussianMixture is None or StandardScaler is None:
-        raise ImportError("scikit-learn is required for regime detection")
-
     df = pd.DataFrame({"ret": returns})
     df["vol"] = returns.rolling(vol_window).std()
     df = df.dropna()
 
-    scaler = StandardScaler()
-    features = scaler.fit_transform(df)
+    if df.empty:
+        return pd.DataFrame(columns=["ret", "vol", "regime", "regime_label"], index=returns.index)
 
-    gmm = GaussianMixture(n_components=components, covariance_type="full", random_state=42)
-    labels = gmm.fit_predict(features)
+    features = df.to_numpy(dtype=float)
+    mean = np.nanmean(features, axis=0)
+    std = np.nanstd(features, axis=0)
+    std[std == 0] = 1.0
+    features = (features - mean) / std
 
+    labels = _kmeans(features, min(components, len(df)), random_state=42)
     df["regime"] = labels
 
-    # Map regimes by mean return ordering (high -> bull, low -> bear)
-    regime_map = (
-        df.groupby("regime")["ret"].mean().sort_values().reset_index().assign(label=["bear", "neutral", "bull"][:components])
-    )
-    mapping = dict(zip(regime_map["regime"], regime_map["label"]))
+    mean_returns = df.groupby("regime")["ret"].mean().sort_values()
+    ordered_labels = ["bear", "neutral", "bull"]
+    mapping = {
+        regime: ordered_labels[min(idx, len(ordered_labels) - 1)]
+        for idx, regime in enumerate(mean_returns.index)
+    }
     df["regime_label"] = df["regime"].map(mapping)
-
+    df = df.reindex(returns.index)
     return df
 
 
@@ -263,7 +378,7 @@ def behavioral_sentiment_analysis(
 ) -> Dict[str, pd.DataFrame]:
     data = pd.concat([returns, sentiment], axis=1).dropna()
     if data.empty:
-        raise ValueError("No overlapping data for behavioral analysis")
+        return {"summary": pd.DataFrame(), "z_scores": pd.DataFrame()}
 
     z_scores = data.apply(lambda col: (col - col.mean()) / col.std(ddof=0))
 
@@ -287,45 +402,46 @@ def behavioral_sentiment_analysis(
         )
 
     z_scores.columns = [f"{c}_z" for c in z_scores.columns]
-    return {"summary": pd.concat(metrics, axis=0), "z_scores": z_scores}
+    summary = pd.concat(metrics, axis=0) if metrics else pd.DataFrame()
+    return {"summary": summary, "z_scores": z_scores}
 
 
 def default_config(data_root: Path) -> Dict[str, Sequence[SeriesConfig]]:
     return {
         "assets": [
-            SeriesConfig("us_equity", "INDEX/Vanguard 500 Index Fund - VFIAX US Equity US.xlsx"),
-            SeriesConfig("us_value", "INDEX/Vanguard Value Index Fund - VVIAX US Equity US.xlsx"),
-            SeriesConfig("us_growth", "INDEX/Vanguard Growth Index Fund - VIGAX US Equity US.xlsx"),
-            SeriesConfig("balanced", "INDEX/Vanguard Balanced Index Fund - VBIAX US Equity US.xlsx"),
-            SeriesConfig("global_infra", "INDEX/Dow Jones Brookfield Global In - DJBGICUT INDEX Index.xlsx"),
-            SeriesConfig("reit", "INDEX/FTSE NAREIT All Reits Total Re - FNARTR Index Index.xlsx"),
-            SeriesConfig("investment_grade", "INDEX/iBoxx USD Liquid Investment Gr - IBOXIG Index Index.xlsx"),
-            SeriesConfig("high_yield", "INDEX/iBoxx USD Liquid High Yield In - IBOXHY Index Index.xlsx"),
-            SeriesConfig("crypto", "INDEX/Bloomberg Galaxy Crypto Index - BGCI Index Index.xlsx"),
+            SeriesConfig("us_equity", "FULL Nexus Data/Vanguard 500 Index Fund - VFIAX US Equity US.xlsx"),
+            SeriesConfig("us_value", "FULL Nexus Data/Vanguard Value Index Fund - VVIAX US Equity US.xlsx"),
+            SeriesConfig("us_growth", "FULL Nexus Data/Vanguard Growth Index Fund - VIGAX US Equity US.xlsx"),
+            SeriesConfig("balanced", "FULL Nexus Data/Vanguard Balanced Index Fund - VBIAX US Equity US.xlsx"),
+            SeriesConfig("global_infra", "FULL Nexus Data/Dow Jones Brookfield Global In - DJBGICUT INDEX Index.xlsx"),
+            SeriesConfig("reit", "FULL Nexus Data/FTSE NAREIT All Reits Total Re - FNARTR Index Index.xlsx"),
+            SeriesConfig("investment_grade", "FULL Nexus Data/iBoxx USD Liquid Investment Gr - IBOXIG Index Index.xlsx"),
+            SeriesConfig("high_yield", "FULL Nexus Data/iBoxx USD Liquid High Yield In - IBOXHY Index Index.xlsx"),
+            SeriesConfig("crypto", "FULL Nexus Data/Bloomberg Galaxy Crypto Index - BGCI Index Index.xlsx"),
         ],
         "macro": [
-            SeriesConfig("gdp_qoq", "INDEX/QoQ % Change Annualized - GDP CQOQ Index Index.xlsx", resample="QS"),
-            SeriesConfig("cpi_yoy", "INDEX/YoY % NSA - CPI YOY Index Index.xlsx"),
-            SeriesConfig("core_cpi_yoy", "INDEX/YoY % NSA - CPI XYOY Index Index.xlsx"),
-            SeriesConfig("pce_mom", "INDEX/Monthly % Change - PCE CRCH Index Index.xlsx"),
-            SeriesConfig("ism_pmi", "INDEX/ISM PMI - NAPMPMI Index Index.xlsx"),
-            SeriesConfig("nfp_change", "INDEX/Net Change SA - NFP TCH Index Index.xlsx"),
-            SeriesConfig("unemployment", "INDEX/Total SA - USURTOT Index Index.xlsx"),
-            SeriesConfig("michigan_sent", "INDEX/Univ. of Michigan Sentiment - CONSSENT INDEX Index.xlsx"),
-            SeriesConfig("conference_board", "INDEX/Confidence - CONCCONF INDEX Index.xlsx"),
-            SeriesConfig("m2", "INDEX/M2 (NSA) - M2NS Index Index.xlsx"),
-            SeriesConfig("ten_year_yield", "INDEX/US Generic Govt 10 Yr - USGG10YR Index Index.xlsx"),
-            SeriesConfig("breakeven_10y", "INDEX/BE 10 Year - USGGBE10 Index Index.xlsx"),
-            SeriesConfig("fed_funds", "INDEX/Fed Funds Target Rate US - FDTR Index Index.xlsx"),
-            SeriesConfig("dollar_index", "INDEX/DOLLAR INDEX SPOT - DXY Index Index.xlsx"),
-            SeriesConfig("economic_surprise", "INDEX/Citi Economic Surprise - Unite - CESIUSD INDEX Index.xlsx"),
-            SeriesConfig("move_index", "INDEX/ICE BofA MOVE Index - MOVE Index Index.xlsx"),
+            SeriesConfig("gdp_qoq", "FULL Nexus Data/QoQ % Change Annualized - GDP CQOQ Index Index.xlsx", resample="QS"),
+            SeriesConfig("cpi_yoy", "FULL Nexus Data/YoY % NSA - CPI YOY Index Index.xlsx"),
+            SeriesConfig("core_cpi_yoy", "FULL Nexus Data/YoY % NSA - CPI XYOY Index Index.xlsx"),
+            SeriesConfig("pce_mom", "FULL Nexus Data/Monthly % Change - PCE CRCH Index Index.xlsx"),
+            SeriesConfig("ism_pmi", "FULL Nexus Data/ISM PMI - NAPMPMI Index Index.xlsx"),
+            SeriesConfig("nfp_change", "FULL Nexus Data/Net Change SA - NFP TCH Index Index.xlsx"),
+            SeriesConfig("unemployment", "FULL Nexus Data/Total SA - USURTOT Index Index.xlsx"),
+            SeriesConfig("michigan_sent", "FULL Nexus Data/Univ. of Michigan Sentiment - CONSSENT INDEX Index.xlsx"),
+            SeriesConfig("conference_board", "FULL Nexus Data/Confidence - CONCCONF INDEX Index.xlsx"),
+            SeriesConfig("m2", "FULL Nexus Data/M2 (NSA) - M2NS Index Index.xlsx"),
+            SeriesConfig("ten_year_yield", "FULL Nexus Data/US Generic Govt 10 Yr - USGG10YR Index Index.xlsx"),
+            SeriesConfig("breakeven_10y", "FULL Nexus Data/BE 10 Year - USGGBE10 Index Index.xlsx"),
+            SeriesConfig("fed_funds", "FULL Nexus Data/Fed Funds Target Rate US - FDTR Index Index.xlsx"),
+            SeriesConfig("dollar_index", "FULL Nexus Data/DOLLAR INDEX SPOT - DXY Index Index.xlsx"),
+            SeriesConfig("economic_surprise", "FULL Nexus Data/Citi Economic Surprise - Unite - CESIUSD INDEX Index.xlsx"),
+            SeriesConfig("move_index", "FULL Nexus Data/ICE BofA MOVE Index - MOVE Index Index.xlsx"),
         ],
         "behavioral": [
-            SeriesConfig("vix", "INDEX/Cboe Volatility Index - VIX Index Index.xlsx"),
-            SeriesConfig("move", "INDEX/ICE BofA MOVE Index - MOVE Index Index.xlsx"),
-            SeriesConfig("sentiment", "INDEX/Univ. of Michigan Sentiment - CONSSENT INDEX Index.xlsx"),
-            SeriesConfig("confidence", "INDEX/Confidence - CONCCONF INDEX Index.xlsx"),
+            SeriesConfig("vix", "FULL Nexus Data/Cboe Volatility Index - VIX Index Index.xlsx"),
+            SeriesConfig("move", "FULL Nexus Data/ICE BofA MOVE Index - MOVE Index Index.xlsx"),
+            SeriesConfig("sentiment", "FULL Nexus Data/Univ. of Michigan Sentiment - CONSSENT INDEX Index.xlsx"),
+            SeriesConfig("confidence", "FULL Nexus Data/Confidence - CONCCONF INDEX Index.xlsx"),
         ],
     }
 
@@ -340,10 +456,14 @@ def run_full_workflow(data_root: Path) -> Dict[str, object]:
     returns = compute_log_returns(assets)
     macro_changes = compute_feature_changes(macro)
 
-    macro_models = run_macro_regressions(returns, macro_changes)
+    macro_models, macro_beta_table, macro_corr_table = run_macro_regressions(returns, macro_changes)
 
-    var_assets = returns[["us_equity", "investment_grade", "high_yield", "crypto", "reit"]]
-    cross_asset = estimate_cross_asset_influence(var_assets)
+    influence_candidates = ["us_equity", "investment_grade", "high_yield", "crypto", "reit"]
+    influence_assets = [col for col in influence_candidates if col in returns.columns]
+    if len(influence_assets) >= 2:
+        cross_asset = estimate_cross_asset_influence(returns[influence_assets])
+    else:
+        cross_asset = {"lead_lag_table": pd.DataFrame(), "top_leads": pd.DataFrame()}
 
     regimes = detect_market_regimes(returns["us_equity"])
 
@@ -357,6 +477,8 @@ def run_full_workflow(data_root: Path) -> Dict[str, object]:
         "macro_levels": macro,
         "macro_changes": macro_changes,
         "macro_models": macro_models,
+        "macro_beta_table": macro_beta_table,
+        "macro_corr_table": macro_corr_table,
         "cross_asset": cross_asset,
         "regimes": regimes,
         "behavioral": behavioral_analysis,
@@ -364,6 +486,8 @@ def run_full_workflow(data_root: Path) -> Dict[str, object]:
 
 
 def format_macro_summary(macro_models: Dict[str, Dict[str, pd.DataFrame]]) -> str:
+    if not macro_models:
+        return "No macro regressions available."
     lines = []
     for asset, stats in macro_models.items():
         coef = stats["coef"].drop(index="const", errors="ignore").sort_values("coef", ascending=False)
@@ -381,7 +505,10 @@ def format_macro_summary(macro_models: Dict[str, Dict[str, pd.DataFrame]]) -> st
 
 
 def format_behavioral_summary(behavioral: Dict[str, pd.DataFrame]) -> str:
-    summary = behavioral["summary"].droplevel(1)
+    summary_df = behavioral.get("summary", pd.DataFrame())
+    if summary_df.empty:
+        return "No behavioural signal statistics available."
+    summary = summary_df.droplevel(1)
     lines = []
     for factor, row in summary.iterrows():
         lines.append(
@@ -397,7 +524,7 @@ def main() -> None:
         "--data-root",
         type=Path,
         default=Path(__file__).resolve().parents[1],
-        help="Path to repository root containing INDEX folder",
+        help="Path to repository root containing the 'FULL Nexus Data' folder",
     )
     parser.add_argument(
         "--log-level",
@@ -414,9 +541,18 @@ def main() -> None:
     logging.info("Loaded %d asset series", results["asset_prices"].shape[1])
     logging.info("Macro regression summary:\n%s", format_macro_summary(results["macro_models"]))
     logging.info("Behavioral signals:\n%s", format_behavioral_summary(results["behavioral"]))
-    logging.info(
-        "Latest regime label: %s", results["regimes"].iloc[-1]["regime_label"]
+    top_leads = results["cross_asset"].get("top_leads", pd.DataFrame())
+    if isinstance(top_leads, pd.DataFrame) and not top_leads.empty:
+        logging.info("Top lead/lag pairs:\n%s", top_leads.to_string(index=False))
+    regimes_df = results.get("regimes", pd.DataFrame())
+    latest_label = (
+        regimes_df["regime_label"].dropna().iloc[-1]
+        if isinstance(regimes_df, pd.DataFrame)
+        and "regime_label" in regimes_df.columns
+        and not regimes_df["regime_label"].dropna().empty
+        else "N/A"
     )
+    logging.info("Latest regime label: %s", latest_label)
 
 
 if __name__ == "__main__":
