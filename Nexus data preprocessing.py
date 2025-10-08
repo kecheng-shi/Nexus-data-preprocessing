@@ -38,6 +38,69 @@ def winsorize(s: pd.Series, lower_q: float = 0.01, upper_q: float = 0.99) -> pd.
     return s.clip(lower=lo, upper=hi)
 
 
+def _read_excel_with_openpyxl(path: str) -> pd.DataFrame:
+    """Fallback reader that walks the worksheet with openpyxl."""
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError("openpyxl is required for Excel fallback parsing") from exc
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    ws = wb.active
+    rows = []
+    for row in ws.iter_rows(values_only=True):
+        if not row:
+            continue
+        if not any(cell is not None for cell in row):
+            continue
+        normalized = []
+        for cell in row:
+            if isinstance(cell, np.ndarray):
+                if cell.size == 0:
+                    normalized.append(np.nan)
+                elif cell.size == 1:
+                    normalized.append(cell.item())
+                else:
+                    normalized.append(cell.reshape(-1)[0])
+            else:
+                normalized.append(cell)
+        rows.append(normalized)
+    wb.close()
+    if not rows:
+        return pd.DataFrame()
+
+    header = rows[0]
+    width = len(header)
+    header = [f"col_{idx}" if name is None else name for idx, name in enumerate(header)]
+    data = []
+    for row in rows[1:]:
+        if len(row) < width:
+            row = list(row) + [None] * (width - len(row))
+        elif len(row) > width:
+            row = list(row[:width])
+        data.append(row)
+    return pd.DataFrame(data, columns=header)
+
+
+def _load_input_frame(path: str) -> pd.DataFrame:
+    """Read Excel with resilient fallbacks for Bloomberg array-formula sheets."""
+    last_exc: Optional[Exception] = None
+    try:
+        return pd.read_excel(path)
+    except Exception as exc:  # pragma: no cover - relies on external file
+        last_exc = exc
+    try:
+        return pd.read_excel(path, engine="openpyxl")
+    except Exception as exc:  # pragma: no cover - relies on external file
+        last_exc = exc
+    try:
+        return _read_excel_with_openpyxl(path)
+    except Exception as exc:  # pragma: no cover - relies on external file
+        if last_exc is not None:
+            raise last_exc from exc
+        raise
+
+
 # ---------- indicators ----------
 def compute_rsi(prices: pd.Series, window: int = 14) -> pd.Series:
     delta = prices.diff()
@@ -92,10 +155,7 @@ def adjust_ohlc_with_adjclose(df: pd.DataFrame,
 # ---------- core ----------
 def preprocess_cat_excel(input_path: str, output_base: str):
     # 1) load
-    try:
-        df = pd.read_excel(input_path)
-    except Exception:
-        df = pd.read_excel(input_path, engine="openpyxl")
+    df = _load_input_frame(input_path)
 
     original_cols = list(df.columns)
 
@@ -266,10 +326,7 @@ def preprocess_cat_excel_core(input_path: str, output_base: str):
 def preprocess_cat_excel_simple(input_path: str, output_base: str):
     # Duplicate minimal logic by reading and writing through the main function
     # (avoids recursive calls in some environments)
-    try:
-        df = pd.read_excel(input_path)
-    except Exception:
-        df = pd.read_excel(input_path, engine="openpyxl")
+    df = _load_input_frame(input_path)
 
     original_cols = list(df.columns)
 
