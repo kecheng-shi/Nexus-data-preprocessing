@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
+from math import erf
 
 import numpy as np
 import pandas as pd
@@ -27,7 +28,12 @@ import pandas as pd
 def _normal_cdf(x: np.ndarray) -> np.ndarray:
     """Standard normal cumulative distribution function."""
     x_arr = np.asarray(x, dtype=float)
-    return 0.5 * (1.0 + np.erf(x_arr / np.sqrt(2.0)))
+    scaled = x_arr / np.sqrt(2.0)
+    if hasattr(np, "erf"):
+        erf_vals = np.erf(scaled)
+    else:  # pragma: no cover - fallback for numpy builds without erf
+        erf_vals = np.vectorize(erf, otypes=[float])(scaled)
+    return 0.5 * (1.0 + erf_vals)
 
 
 def _ols_fit(y: np.ndarray, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
@@ -532,6 +538,24 @@ def main() -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Logging level",
     )
+    parser.add_argument(
+        "--show-macro",
+        action="store_true",
+        help="Display the unprocessed macro series levels in the console",
+    )
+    parser.add_argument(
+        "--macro-rows",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Number of rows to display when showing macro series (default: 10)",
+    )
+    parser.add_argument(
+        "--macro-series",
+        nargs="*",
+        default=None,
+        help="Optional subset of macro series names to display",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level))
@@ -553,6 +577,25 @@ def main() -> None:
         else "N/A"
     )
     logging.info("Latest regime label: %s", latest_label)
+
+    if args.show_macro:
+        macro_levels = results.get("macro_levels", pd.DataFrame())
+        if not isinstance(macro_levels, pd.DataFrame) or macro_levels.empty:
+            logging.warning("Macro series data unavailable to display.")
+        else:
+            to_show = macro_levels.copy()
+            if args.macro_series:
+                requested = [col for col in args.macro_series if col in to_show.columns]
+                missing = sorted(set(args.macro_series) - set(requested))
+                if missing:
+                    logging.warning("Requested macro series missing: %s", ", ".join(missing))
+                if requested:
+                    to_show = to_show[requested]
+                else:
+                    logging.warning("No valid macro series selected; showing all available.")
+            rows = max(args.macro_rows, 1)
+            print("\n=== Macro Series (unprocessed levels) ===")
+            print(to_show.head(rows).to_string())
 
 
 if __name__ == "__main__":
