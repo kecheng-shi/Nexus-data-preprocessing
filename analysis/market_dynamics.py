@@ -310,7 +310,8 @@ def estimate_cross_asset_influence(
     maxlags: int = 5,
 ) -> Dict[str, pd.DataFrame]:
     records = []
-    monthly = returns.resample("M").sum(min_count=1)
+    # Use month-end frequency to avoid deprecated alias and keep financial alignment.
+    monthly = returns.resample("ME").sum(min_count=1)
     monthly = monthly.dropna(how="all")
     if monthly.empty:
         return {"lead_lag_table": pd.DataFrame(), "top_leads": pd.DataFrame()}
@@ -324,7 +325,13 @@ def estimate_cross_asset_influence(
                 continue
             for lag in range(1, maxlags + 1):
                 shifted = base[source].shift(-lag)
-                corr = shifted.corr(base[target])
+                aligned = pd.concat(
+                    [shifted.rename("leader"), base[target].rename("follower")],
+                    axis=1,
+                ).dropna()
+                if aligned.shape[0] < 2:
+                    continue
+                corr = aligned["leader"].corr(aligned["follower"])
                 if pd.notna(corr):
                     records.append(
                         {
