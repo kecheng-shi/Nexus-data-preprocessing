@@ -154,6 +154,7 @@ from analysis.transformations import (
 )
 from analysis.phases import assign_phase, assign_phase_quantile, pick_columns
 from analysis.plotting import segments_from_labels
+from analysis.stats import pairwise_corr
 
 excel_files = sorted(RAW_DATA_DIR.glob('*.xlsx'))
 catalog = pl.DataFrame({
@@ -935,7 +936,8 @@ combined_panel = asset_class_panel.join(macro_changes_pd, how="inner").sort_inde
 
 # Correlations across all included classes and macro factors
 corr_cols = asset_class_cols + macro_change_cols
-correlation_matrix = combined_panel[corr_cols].corr()
+corr_input = combined_panel[corr_cols]
+correlation_matrix = pairwise_corr(corr_input, min_periods=MIN_OBS)
 
 # Standardised regressions per asset class
 beta_records, r2_records, sample_records = [], [], []
@@ -1066,7 +1068,7 @@ interaction_panel = interaction_panel.sort_index()
 if interaction_panel.empty:
     raise ValueError("Asset class panel is empty; ensure previous steps produced monthly returns.")
 
-class_corr = interaction_panel.corr(min_periods=CLASS_MIN_OBS)
+class_corr = pairwise_corr(interaction_panel, min_periods=CLASS_MIN_OBS)
 avg_abs_corr = class_corr.abs().mean().sort_values(ascending=False)
 ordered_cols = list(avg_abs_corr.index)
 
