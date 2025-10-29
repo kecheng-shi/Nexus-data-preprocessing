@@ -10,7 +10,7 @@ __all__ = ["pick_columns", "assign_phase", "assign_phase_quantile"]
 
 
 def pick_columns(candidates: Iterable[str], available: Sequence[str]) -> list[str]:
-    """Return candidate names that are present in `available`."""
+    """Return candidate names that are present in ``available``."""
     available_set = set(available)
     return [col for col in candidates if col in available_set]
 
