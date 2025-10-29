@@ -24,6 +24,7 @@ from math import erf
 import numpy as np
 import pandas as pd
 
+from .asset_universe import AssetUniverse, build_asset_universe
 
 def _normal_cdf(x: np.ndarray) -> np.ndarray:
     """Standard normal cumulative distribution function."""
@@ -47,12 +48,20 @@ def _ols_fit(y: np.ndarray, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.n
     resid = y - X @ beta
     dof = max(len(y) - X.shape[1], 1)
     sigma2 = float(resid.T @ resid) / dof
-    se = np.sqrt(np.diag(XtX_inv) * sigma2)
+    if sigma2 < 0:
+        sigma2 = 0.0
+    var_terms = np.clip(np.diag(XtX_inv) * sigma2, a_min=0.0, a_max=None)
+    se = np.sqrt(var_terms)
     with np.errstate(divide="ignore", invalid="ignore"):
         t_vals = np.divide(beta, se, out=np.full_like(beta, np.nan), where=se != 0)
     p_vals = 2.0 * (1.0 - _normal_cdf(np.abs(t_vals)))
-    denom = float(((y - y.mean()) ** 2).sum())
-    r_sq = np.nan if denom == 0 else 1.0 - float((resid ** 2).sum()) / denom
+    y_centered = y - np.nanmean(y)
+    denom = float(np.nan_to_num(y_centered ** 2).sum())
+    resid_sq = np.nan_to_num(resid ** 2)
+    if denom <= 0:
+        r_sq = np.nan
+    else:
+        r_sq = 1.0 - float(resid_sq.sum()) / denom
     return beta, se, t_vals, p_vals, r_sq
 
 
@@ -261,8 +270,17 @@ def run_macro_regressions(
         data = pd.concat([returns[asset], macro_features], axis=1).dropna()
         if data.empty:
             continue
+        data = data.replace([np.inf, -np.inf], np.nan).dropna()
+        if data.empty:
+            continue
+        if data.shape[0] <= data.shape[1]:
+            continue
+        if data[asset].std(ddof=0) == 0:
+            continue
         y = data[asset].to_numpy()
         X_no_const = data.drop(columns=[asset])
+        if any(data[col].std(ddof=0) == 0 for col in X_no_const.columns):
+            continue
         X_design = np.column_stack([np.ones(len(X_no_const)), X_no_const.to_numpy()])
         beta, se, t_vals, p_vals, r_sq = _ols_fit(y, X_design)
         index = ["const"] + list(X_no_const.columns)
@@ -303,6 +321,89 @@ def run_macro_regressions(
     macro_beta_table = pd.DataFrame(beta_records)
     macro_corr_table = pd.DataFrame(corr_records)
     return macro_models, macro_beta_table, macro_corr_table
+
+
+def run_macro_driver_study(
+    data_root: Path,
+    *,
+    min_months: int = 1,
+    macro_resample: str = "ME",
+) -> Dict[str, object]:
+    """Assemble macro-driver inputs using the full asset universe.
+
+    Returns a dictionary containing:
+    - asset_universe: AssetUniverse object with returns and metadata
+    - macro_features: monthly macro change panel
+    - macro_models / macro_beta_table / macro_corr_table: regression artefacts
+    - asset_class_inventory: coverage summary per asset class
+    """
+    config = default_config(data_root)
+    macro = load_series_frame(config["macro"], data_root)
+    macro_changes = compute_feature_changes(macro)
+    if macro_resample:
+        macro_changes = (
+            macro_changes.resample(macro_resample).last().dropna(how="all")
+            if not macro_changes.empty
+            else macro_changes
+        )
+
+    universe: AssetUniverse = build_asset_universe(min_months=min_months)
+    asset_returns = universe.class_returns.dropna(how="all")
+
+    if asset_returns.empty or macro_changes.empty:
+        return {
+            "asset_universe": universe,
+            "macro_features": macro_changes,
+            "macro_models": {},
+            "macro_beta_table": pd.DataFrame(),
+            "macro_corr_table": pd.DataFrame(),
+            "asset_class_inventory": pd.DataFrame(),
+        }
+
+    common_index = asset_returns.index.intersection(macro_changes.index)
+    if common_index.empty:
+        return {
+            "asset_universe": universe,
+            "macro_features": macro_changes,
+            "macro_models": {},
+            "macro_beta_table": pd.DataFrame(),
+            "macro_corr_table": pd.DataFrame(),
+            "asset_class_inventory": pd.DataFrame(),
+        }
+
+    returns_aligned = asset_returns.loc[common_index]
+    macro_aligned = macro_changes.loc[common_index]
+
+    macro_models, macro_beta_table, macro_corr_table = run_macro_regressions(
+        returns_aligned, macro_aligned
+    )
+
+    inventory_rows = []
+    for cls in sorted(returns_aligned.columns):
+        series = returns_aligned[cls].dropna()
+        members = universe.class_members.get(cls, [])
+        metadata_matches = universe.series_metadata[universe.series_metadata["asset_class"] == cls]
+        examples = "; ".join(metadata_matches["label"].head(3)) if not metadata_matches.empty else ""
+        inventory_rows.append(
+            {
+                "asset_class": cls,
+                "series_count": len(members),
+                "sample_months": int(series.shape[0]),
+                "sample_start": series.index.min(),
+                "sample_end": series.index.max(),
+                "representative_series": examples,
+            }
+        )
+    asset_class_inventory = pd.DataFrame(inventory_rows).sort_values("asset_class")
+
+    return {
+        "asset_universe": universe,
+        "macro_features": macro_aligned,
+        "macro_models": macro_models,
+        "macro_beta_table": macro_beta_table,
+        "macro_corr_table": macro_corr_table,
+        "asset_class_inventory": asset_class_inventory,
+    }
 
 
 def estimate_cross_asset_influence(
