@@ -37,7 +37,12 @@ def pair_list_from_block(block: pd.DataFrame, panel: pd.DataFrame | None = None)
                     "overlap_months": overlap,
                 }
             )
-    return pd.DataFrame(rows).sort_values("correlation", ascending=False).reset_index(drop=True)
+    df = pd.DataFrame.from_records(
+        rows, columns=["macro", "asset", "correlation", "overlap_months"]
+    )
+    if df.empty:
+        return df
+    return df.sort_values("correlation", ascending=False).reset_index(drop=True)
 
 
 def unique_pair_stats(corr_df: pd.DataFrame, panel: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -73,5 +78,9 @@ def unique_pair_stats(corr_df: pd.DataFrame, panel: pd.DataFrame | None = None) 
                     "overlap_months": overlap,
                 }
             )
-    return pd.DataFrame(records).sort_values("correlation", ascending=False).reset_index(drop=True)
-
+    df = pd.DataFrame.from_records(
+        records, columns=["asset_a", "asset_b", "correlation", "overlap_months"]
+    )
+    if df.empty:
+        return df
+    return df.sort_values("correlation", ascending=False).reset_index(drop=True)
